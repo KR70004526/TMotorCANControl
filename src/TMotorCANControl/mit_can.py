@@ -267,31 +267,39 @@ class CAN_Manager(object):
     """
     # Note, defining singletons in this way means that you cannot inherit
     # from this class, as apparently __init__ for the subclass will be called twice
-    _instance = None
+    _instances = {}
     """
     Used to keep track of one instantation of the class to make a singleton object
     """
     
-    def __new__(cls):
+    def __new__(cls, channel='can0', bitrate=1000000, bring_up=True, bring_down=False):
         """
         Makes a singleton object to manage a socketcan_native CAN bus.
         """
-        if not cls._instance:
-            cls._instance = super(CAN_Manager, cls).__new__(cls)
-            print("Initializing CAN Manager")
-            # verify the CAN bus is currently down
-            os.system( 'sudo /sbin/ip link set can0 down' )
-            # start the CAN bus back up
-            os.system( 'sudo /sbin/ip link set can0 up type can bitrate 1000000' )
-            # create a python-can bus object
-            cls._instance.bus = can.interface.Bus(channel='can0', bustype='socketcan')# bustype='socketcan_native')
-            # create a python-can notifier object, which motors can later subscribe to
-            cls._instance.notifier = can.Notifier(bus=cls._instance.bus, listeners=[])
-            print("Connected on: " + str(cls._instance.bus))
+        key = (channel, int(bitrate))
+        if key not in cls._instances:
+                inst = super(CAN_Manager, cls).__new__(cls)
 
-        return cls._instance
+                print(f"Initializing CAN Manager: {channel} @ {int(bitrate)}")
 
-    def __init__(self):
+                if bring_up:
+                        os.system(f"sudo /sbin/ip link set {channel} down")
+                        os.system(f"sudo /sbin/ip link set {channel} up type can bitrate {int(bitrate)}")
+
+                inst.bus = can.interface.Bus(channel=channel, bustype="socketcan")
+                inst.notifier = can.Notifier(bus=inst.bus, listeners=[])
+
+                inst.channel = channel
+                inst.bitrate = int(bitrate)
+                inst.bring_down = bool(bring_down)
+
+                print("Connected on: " + str(inst.bus))
+
+                cls._instances[key] = inst
+
+        return cls._instances[key]
+
+    def __init__(self, *args, **kwargs):
         """
         ALl initialization happens in __new__
         """
@@ -543,7 +551,7 @@ class TMotorManager_mit_can():
     used in the context of a with as block, in order to safely enter/exit
     control of the motor.
     """
-    def __init__(self, motor_type='AK80-9', motor_ID=1, max_mosfett_temp=50, CSV_file=None, log_vars = LOG_VARIABLES):
+    def __init__(self, motor_type='AK80-9', motor_ID=1, max_mosfett_temp=50, CSV_file=None, log_vars = LOG_VARIABLES, can_interface='can0', can_bitrate=1000000, can_bring_up=True):
         """
         Sets up the motor manager. Note the device will not be powered on by this method! You must
         call __enter__, mostly commonly by using a with block, before attempting to control the motor.
@@ -605,7 +613,7 @@ class TMotorManager_mit_can():
             "motor_torque": self.get_motor_torque_newton_meters 
         }
         
-        self._canman = CAN_Manager()
+        self._canman = CAN_Manager(channel=can_interface, bitrate=can_bitrate, bring_up=can_bring_up)
         self._canman.add_motor(self)
         
             
