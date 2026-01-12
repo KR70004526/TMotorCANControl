@@ -253,56 +253,77 @@ class motorListener(can.Listener):
         args:
             msg: A python-can CAN message
         """
+        # In MIT mode, the motor ID is the CAN arbitration_id (standard 11-bit ID).
+        # The payload is the 8-byte MIT state frame (position/velocity/current/…)
+        if msg.arbitration_id != self.motor.ID:
+            return
         data = bytes(msg.data)
-        ID = data[0]
-        if ID == self.motor.ID:
-            self.motor._update_state_async(self.canman.parse_MIT_message(data, self.motor.type))
+        self.motor._update_state_async(self.canman.parse_MIT_message(data, self.motor.type))
 
 # A class to manage the low level CAN communication protocols
 class CAN_Manager(object):
-    """A class to manage the low level CAN communication protocols"""
     debug = False
-    """
-    Set to true to display every message sent and recieved for debugging.
-    """
-    # Note, defining singletons in this way means that you cannot inherit
-    # from this class, as apparently __init__ for the subclass will be called twice
     _instance = None
-    """
-    Used to keep track of one instantation of the class to make a singleton object
-    """
-    
-    def __new__(cls):
-        """
-        Makes a singleton object to manage a socketcan_native CAN bus.
-        """
-        if not cls._instance:
+
+    def __new__(cls, interface=None, channel=None, bitrate=1_000_000, bring_up=None):
+        # CAN_Manager is a process-wide singleton. If a caller tries to re-create it with a
+        # different (interface/channel/bitrate/bring_up), that's almost always a bug and should
+        # fail loudly rather than silently misrouting frames.
+        if cls._instance is not None:
+            if interface is not None and interface != cls._instance.interface:
+                raise ValueError(f"CAN_Manager already initialized with interface={cls._instance.interface}, requested {interface}")
+            if channel is not None and channel != cls._instance.channel:
+                raise ValueError(f"CAN_Manager already initialized with channel={cls._instance.channel}, requested {channel}")
+            if bitrate is not None and bitrate != cls._instance.bitrate:
+                raise ValueError(f"CAN_Manager already initialized with bitrate={cls._instance.bitrate}, requested {bitrate}")
+            if bring_up is not None and bring_up != cls._instance.bring_up:
+                raise ValueError(f"CAN_Manager already initialized with bring_up={cls._instance.bring_up}, requested {bring_up}")
+            return cls._instance
+
+        if cls._instance is None:
             cls._instance = super(CAN_Manager, cls).__new__(cls)
+
+            # --- defaults: Windows=gs_usb, Linux=socketcan ---
+            if interface is None:
+                interface = "gs_usb" if os.name == "nt" else "socketcan"
+            if bring_up is None:
+                bring_up = False if os.name == "nt" else True
+            if channel is None:
+                channel = 0 if interface == "gs_usb" else "can0"
+
+            cls._instance.interface = interface
+            cls._instance.channel = channel
+            cls._instance.bitrate = bitrate
+            cls._instance.bring_up = bring_up
+
             print("Initializing CAN Manager")
-            # verify the CAN bus is currently down
-            os.system( 'sudo /sbin/ip link set can0 down' )
-            # start the CAN bus back up
-            os.system( 'sudo /sbin/ip link set can0 up type can bitrate 1000000' )
-            # create a python-can bus object
-            cls._instance.bus = can.interface.Bus(channel='can0', bustype='socketcan')# bustype='socketcan_native')
-            # create a python-can notifier object, which motors can later subscribe to
+
+            if bring_up and interface in ("socketcan", "socketcan_native"):
+                if not isinstance(channel, str):
+                    raise ValueError("SocketCAN channel must be like 'can0'")
+                os.system(f"sudo /sbin/ip link set {channel} down")
+                os.system(f"sudo /sbin/ip link set {channel} up type can bitrate {bitrate}")
+
+            cls._instance.bus = can.Bus(interface=interface, channel=channel, bitrate=bitrate)
             cls._instance.notifier = can.Notifier(bus=cls._instance.bus, listeners=[])
-            print("Connected on: " + str(cls._instance.bus))
+
+            print(f"Connected CAN: interface={interface}, channel={channel}, bitrate={bitrate}")
 
         return cls._instance
 
-    def __init__(self):
-        """
-        ALl initialization happens in __new__
-        """
+
+    def __init__(self, *args, **kwargs):
         pass
         
+
     def __del__(self):
-        """
-        # shut down the CAN bus when the object is deleted
-        # This may not ever get called, so keep a reference and explicitly delete if this is important.
-        """
-        os.system( 'sudo /sbin/ip link set can0 down' ) 
+        try:
+            if os.name != "nt" and getattr(self, "bring_up", False) and getattr(self, "interface", "") in ("socketcan", "socketcan_native"):
+                ch = getattr(self, "channel", "can0")
+                if isinstance(ch, str):
+                    os.system(f"sudo /sbin/ip link set {ch} down")
+        except:
+            pass
 
     # subscribe a motor object to the CAN bus to be updated upon message reception
     def add_motor(self, motor):
@@ -484,16 +505,46 @@ class CAN_Manager(object):
             'torque' value, which is i*Kt. This allows control based on actual q-axis current,
             rather than estimated torque, which doesn't account for friction losses.
         """
-        assert len(data) == 8 or len(data) == 6, 'Tried to parse a CAN message that was not Motor State in MIT Mode'
+                # Motor state frames in MIT mode are typically 8 bytes (DLC=8), where the motor ID is the
+        # CAN arbitration_id (NOT included in the payload).
+        # Some bridges/firmwares may use shorter DLC (e.g., 6) without temperature/error.
+        data = bytes(data)
+        dlc = len(data)
+        assert dlc in (5, 6, 7, 8), 'Tried to parse a CAN message that was not Motor State in MIT Mode'
         temp = None
         error = None
-        position_uint = data[1] <<8 | data[2]
-        velocity_uint = ((data[3] << 8) | (data[4]>>4) <<4 ) >> 4
-        current_uint = (data[4]&0x0F)<<8 | data[5]
-        
-        if len(data)  == 8:
-            temp = int(data[6])
-            error = int(data[7])
+
+        # Core fields (most common layout)
+        #   pos: 16 bits  -> data[0:2]
+        #   vel: 12 bits  -> data[2] + high nibble of data[3]
+        #   cur: 12 bits  -> low nibble of data[3] + data[4]
+        position_uint = (data[0] << 8) | data[1]
+        velocity_uint = (data[2] << 4) | (data[3] >> 4)
+        current_uint = ((data[3] & 0x0F) << 8) | data[4]
+
+        # Optional temperature/error bytes.
+        # Many implementations use: temp=data[5], error=data[6], and data[7] reserved(=0).
+        if dlc >= 7:
+            candA_temp, candA_err = int(data[5]), int(data[6])
+            if dlc >= 8:
+                candB_temp, candB_err = int(data[6]), int(data[7])
+
+                def _score_temp_err(t, e):
+                    s = 0
+                    if -40 <= t <= 200:
+                        s += 2
+                    if 0 <= e <= 255:
+                        s += 1
+                    if e < 64:
+                        s += 1
+                    return s
+
+                if _score_temp_err(candB_temp, candB_err) > _score_temp_err(candA_temp, candA_err):
+                    temp, error = candB_temp, candB_err
+                else:
+                    temp, error = candA_temp, candA_err
+            else:
+                temp, error = candA_temp, candA_err
 
         position = CAN_Manager.uint_to_float(position_uint, MIT_Params[motor_type]['P_min'], 
                                             MIT_Params[motor_type]['P_max'], 16)
@@ -543,7 +594,7 @@ class TMotorManager_mit_can():
     used in the context of a with as block, in order to safely enter/exit
     control of the motor.
     """
-    def __init__(self, motor_type='AK80-9', motor_ID=1, max_mosfett_temp=50, CSV_file=None, log_vars = LOG_VARIABLES):
+    def __init__(self, motor_type='AK80-9', motor_ID=1, max_mosfett_temp=50, CSV_file=None, log_vars = LOG_VARIABLES, can_interface=None, can_channel=None, can_bitrate=1_000_000, can_bring_up=None):
         """
         Sets up the motor manager. Note the device will not be powered on by this method! You must
         call __enter__, mostly commonly by using a with block, before attempting to control the motor.
@@ -605,7 +656,12 @@ class TMotorManager_mit_can():
             "motor_torque": self.get_motor_torque_newton_meters 
         }
         
-        self._canman = CAN_Manager()
+        self._canman = CAN_Manager(
+            interface=can_interface,
+            channel=can_channel,
+            bitrate=can_bitrate,
+            bring_up=can_bring_up
+        )
         self._canman.add_motor(self)
         
             
@@ -667,13 +723,16 @@ class TMotorManager_mit_can():
         Raises:
             RuntimeError when device sends back an error code that is not 0 (0 meaning no error)
         """
-        if MIT_state.error != 0:
+        if (MIT_state.error is not None) and (MIT_state.error != 0):
             raise RuntimeError('Driver board error for device: ' + self.device_info_string() + ": " + MIT_Params['ERROR_CODES'][MIT_state.error])
 
         now = time.time()
-        dt = self._last_update_time - now
+        dt = now - self._last_update_time
+        # Guard against zero/negative dt (can happen on first packet or clock adjustments)
+        if dt <= 0:
+            dt = 1e-6
         self._last_update_time = now
-        acceleration = (MIT_state.velocity - self._motor_state_async.velocity)/dt
+        acceleration = (MIT_state.velocity - self._motor_state_async.velocity) / dt
 
         # The "Current" supplied by the controller is actually current*Kt, which approximates torque.
         self._motor_state_async.set_state(MIT_state.position, MIT_state.velocity, self.TMotor_current_to_qaxis_current(MIT_state.current), MIT_state.temperature, MIT_state.error, acceleration)
