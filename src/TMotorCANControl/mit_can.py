@@ -2,7 +2,7 @@ import can
 import time
 import csv
 import traceback
-from collections import namedtuple
+from collections import namedtuple, deque
 from enum import Enum
 from math import isfinite
 import numpy as np
@@ -231,55 +231,80 @@ MIT_motor_state = namedtuple('motor_state', 'position velocity current temperatu
 Motor state from the controller, uneditable named tuple
 """
 
+# ---- CubeMars MIT helpers ----
+# Special command frames that can appear as TX-echo on some adapters/backends.
+ENTER_FRAME = bytes.fromhex('ff ff ff ff ff ff ff fc')
+EXIT_FRAME  = bytes.fromhex('ff ff ff ff ff ff ff fd')
+ZERO_FRAME  = bytes.fromhex('ff ff ff ff ff ff ff fe')
+
+
+
+# python-can listener object, with handler to be called upon reception of a message on the CAN bus
 # python-can listener object, with handler to be called upon reception of a message on the CAN bus
 class motorListener(can.Listener):
-    """Python-can listener object, with handler to be called upon reception of a message on the CAN bus"""
+    """Listener for a single motor (CubeMars MIT).
+
+    IMPORTANT:
+      - python-can (>=4.x) requires Listener subclasses to implement `on_message_received`.
+      - gs_usb 등 일부 백엔드에서는 TX-echo가 RX로 섞여 들어올 수 있다.
+      - CubeMars MIT reply는 data[0]에 motor/driver ID가 들어간다.
+    """
+
     def __init__(self, canman, motor):
-        """
-        Sets stores can manager and motor object references
-        
-        Args:
-            canman: The CanManager object to get messages from
-            motor: The TMotorCANManager object to update
-        """
         self.canman = canman
         self.bus = canman.bus
         self.motor = motor
 
     def on_message_received(self, msg):
-        """
-        Updates this listener's motor with the info contained in msg, if that message was for this motor.
-
-        args:
-            msg: A python-can CAN message
-        """
-        # In MIT mode, the motor ID is the CAN arbitration_id (standard 11-bit ID).
-        # The payload is the 8-byte MIT state frame (position/velocity/current/…)
-        if msg.arbitration_id != self.motor.ID:
+        """RX handler (must not raise)."""
+        if msg is None:
             return
-        data = bytes(msg.data)
-        self.motor._update_state_async(self.canman.parse_MIT_message(data, self.motor.type))
+        if getattr(msg, "dlc", 0) != 8:
+            return
 
-# A class to manage the low level CAN communication protocols
+        data = bytes(msg.data)
+
+        # Drop special command echoes
+        if data in (ENTER_FRAME, EXIT_FRAME, ZERO_FRAME):
+            return
+
+        # Drop TX-echo by comparing with recent TX payload history (per motor ID)
+        try:
+            hist = self.canman.get_last_tx(self.motor.ID)
+        except Exception:
+            hist = None
+
+        if hist is not None:
+            try:
+                if data in hist:  # hist is typically deque[bytes]
+                    return
+            except TypeError:
+                # Fallback if hist isn't iterable for some reason
+                try:
+                    if data == bytes(hist):
+                        return
+                except Exception:
+                    pass
+
+        # Accept only CubeMars MIT replies: first byte is driver ID
+        if data[0] != int(self.motor.ID):
+            return
+
+        try:
+            st = self.canman.parse_MIT_message(data, self.motor.type)
+            self.motor._update_state_async(st)
+        except Exception as e:
+            # Never raise in Notifier thread; store for later diagnosis
+            try:
+                self.motor._rx_last_exception = e
+            except Exception:
+                pass
+            return
 class CAN_Manager(object):
     debug = False
     _instance = None
 
     def __new__(cls, interface=None, channel=None, bitrate=1_000_000, bring_up=None):
-        # CAN_Manager is a process-wide singleton. If a caller tries to re-create it with a
-        # different (interface/channel/bitrate/bring_up), that's almost always a bug and should
-        # fail loudly rather than silently misrouting frames.
-        if cls._instance is not None:
-            if interface is not None and interface != cls._instance.interface:
-                raise ValueError(f"CAN_Manager already initialized with interface={cls._instance.interface}, requested {interface}")
-            if channel is not None and channel != cls._instance.channel:
-                raise ValueError(f"CAN_Manager already initialized with channel={cls._instance.channel}, requested {channel}")
-            if bitrate is not None and bitrate != cls._instance.bitrate:
-                raise ValueError(f"CAN_Manager already initialized with bitrate={cls._instance.bitrate}, requested {bitrate}")
-            if bring_up is not None and bring_up != cls._instance.bring_up:
-                raise ValueError(f"CAN_Manager already initialized with bring_up={cls._instance.bring_up}, requested {bring_up}")
-            return cls._instance
-
         if cls._instance is None:
             cls._instance = super(CAN_Manager, cls).__new__(cls)
 
@@ -307,6 +332,9 @@ class CAN_Manager(object):
             cls._instance.bus = can.Bus(interface=interface, channel=channel, bitrate=bitrate)
             cls._instance.notifier = can.Notifier(bus=cls._instance.bus, listeners=[])
 
+
+            cls._instance._last_tx = {}  # motor_id -> deque[bytes] of recent TX payloads (echo filter)
+            cls._instance._tx_hist_len = 32
             print(f"Connected CAN: interface={interface}, channel={channel}, bitrate={bitrate}")
 
         return cls._instance
@@ -315,6 +343,14 @@ class CAN_Manager(object):
     def __init__(self, *args, **kwargs):
         pass
         
+
+
+    def get_last_tx(self, motor_id):
+        """Return a deque of recent TX payloads for motor_id (echo filtering)."""
+        try:
+            return self._last_tx.get(int(motor_id))
+        except Exception:
+            return None
 
     def __del__(self):
         try:
@@ -409,6 +445,17 @@ class CAN_Manager(object):
         message = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False)
         try:
             self.bus.send(message)
+            # store recent TX payloads for echo filtering
+            try:
+                mid = int(motor_id)
+                payload = bytes(message.data)
+                dq = self._last_tx.get(mid)
+                if dq is None:
+                    dq = deque(maxlen=getattr(self, '_tx_hist_len', 32))
+                    self._last_tx[mid] = dq
+                dq.append(payload)
+            except Exception:
+                pass
             if self.debug:
                 print("    Message sent on " + str(self.bus.channel_info) )
         except can.CanError:
@@ -505,46 +552,16 @@ class CAN_Manager(object):
             'torque' value, which is i*Kt. This allows control based on actual q-axis current,
             rather than estimated torque, which doesn't account for friction losses.
         """
-                # Motor state frames in MIT mode are typically 8 bytes (DLC=8), where the motor ID is the
-        # CAN arbitration_id (NOT included in the payload).
-        # Some bridges/firmwares may use shorter DLC (e.g., 6) without temperature/error.
-        data = bytes(data)
-        dlc = len(data)
-        assert dlc in (5, 6, 7, 8), 'Tried to parse a CAN message that was not Motor State in MIT Mode'
+        assert len(data) == 8 or len(data) == 6, 'Tried to parse a CAN message that was not Motor State in MIT Mode'
         temp = None
         error = None
-
-        # Core fields (most common layout)
-        #   pos: 16 bits  -> data[0:2]
-        #   vel: 12 bits  -> data[2] + high nibble of data[3]
-        #   cur: 12 bits  -> low nibble of data[3] + data[4]
-        position_uint = (data[0] << 8) | data[1]
-        velocity_uint = (data[2] << 4) | (data[3] >> 4)
-        current_uint = ((data[3] & 0x0F) << 8) | data[4]
-
-        # Optional temperature/error bytes.
-        # Many implementations use: temp=data[5], error=data[6], and data[7] reserved(=0).
-        if dlc >= 7:
-            candA_temp, candA_err = int(data[5]), int(data[6])
-            if dlc >= 8:
-                candB_temp, candB_err = int(data[6]), int(data[7])
-
-                def _score_temp_err(t, e):
-                    s = 0
-                    if -40 <= t <= 200:
-                        s += 2
-                    if 0 <= e <= 255:
-                        s += 1
-                    if e < 64:
-                        s += 1
-                    return s
-
-                if _score_temp_err(candB_temp, candB_err) > _score_temp_err(candA_temp, candA_err):
-                    temp, error = candB_temp, candB_err
-                else:
-                    temp, error = candA_temp, candA_err
-            else:
-                temp, error = candA_temp, candA_err
+        position_uint = data[1] <<8 | data[2]
+        velocity_uint = ((data[3] << 8) | (data[4]>>4) <<4 ) >> 4
+        current_uint = (data[4]&0x0F)<<8 | data[5]
+        
+        if len(data)  == 8:
+            temp = int(data[6]) - 40  # CubeMars: Temperature = T - 40
+            error = int(data[7])
 
         position = CAN_Manager.uint_to_float(position_uint, MIT_Params[motor_type]['P_min'], 
                                             MIT_Params[motor_type]['P_max'], 16)
@@ -713,35 +730,37 @@ class TMotorManager_mit_can():
     # this method is called by the handler every time a message is recieved on the bus
     # from this motor, to store the most recent state information for later
     def _update_state_async(self, MIT_state):
-        """
-        This method is called by the handler every time a message is recieved on the bus
-        from this motor, to store the most recent state information for later
-        
-        Args:
-            MIT_state: The MIT_Motor_State namedtuple with the most recent motor state.
+        """Called from python-can Notifier thread.
 
-        Raises:
-            RuntimeError when device sends back an error code that is not 0 (0 meaning no error)
+        Never raise from here (kills RX thread). Store state/error only.
         """
-        if (MIT_state.error is not None) and (MIT_state.error != 0):
-            raise RuntimeError('Driver board error for device: ' + self.device_info_string() + ": " + MIT_Params['ERROR_CODES'][MIT_state.error])
-
         now = time.time()
-        dt = now - self._last_update_time
-        # Guard against zero/negative dt (can happen on first packet or clock adjustments)
-        if dt <= 0:
-            dt = 1e-6
+
+        # dt and acceleration (best-effort)
+        dt = None
+        if getattr(self, "_last_update_time", None) is not None:
+            dt = now - self._last_update_time
         self._last_update_time = now
-        acceleration = (MIT_state.velocity - self._motor_state_async.velocity) / dt
 
-        # The "Current" supplied by the controller is actually current*Kt, which approximates torque.
-        self._motor_state_async.set_state(MIT_state.position, MIT_state.velocity, self.TMotor_current_to_qaxis_current(MIT_state.current), MIT_state.temperature, MIT_state.error, acceleration)
-        
+        prev_vel = self._motor_state_async.velocity
+        if dt is None or dt <= 1e-6 or not isfinite(dt):
+            acc = 0.0
+        else:
+            acc = (MIT_state.velocity - prev_vel) / dt
+
+        # Note: driver-reported "current" is ~ torque estimate (i*Kt) in this protocol.
+        self._motor_state_async.set_state(
+            MIT_state.position,
+            MIT_state.velocity,
+            self.TMotor_current_to_qaxis_current(MIT_state.current),
+            MIT_state.temperature,
+            MIT_state.error,
+            acc,
+        )
+
+        self._last_error_code = int(MIT_state.error) if MIT_state.error is not None else 0
         self._updated = True
-
-    
-    # this method is called by the user to synchronize the current state used by the controller
-    # with the most recent message recieved
+        
     def update(self):
         """
         This method is called by the user to synchronize the current state used by the controller
@@ -752,8 +771,15 @@ class TMotorManager_mit_can():
         if not self._entered:
             raise RuntimeError("Tried to update motor state before safely powering on for device: " + self.device_info_string())
 
-        if self.get_temperature_celsius() > self.max_temp:
+        temp_c = self.get_temperature_celsius()
+        if temp_c is not None and isfinite(temp_c) and (-40.0 <= temp_c <= 215.0) and temp_c > self.max_temp:
             raise RuntimeError("Temperature greater than {}C for device: {}".format(self.max_temp, self.device_info_string()))
+        # Driver error handling (main thread)
+        err = self.get_motor_error_code()
+        if err not in (0, None):
+            desc = MIT_Params.get('ERROR_CODES', {}).get(err, f"Unknown driver error code {err}")
+            raise RuntimeError(f"Driver board error for device: {self.device_info_string()}: {desc}")
+
 
         # check that the motor data is recent
         # print(self._command_sent)
@@ -1142,28 +1168,55 @@ class TMotorManager_mit_can():
         return str(self.type) + "  ID: " + str(self.ID)
 
     # Checks the motor connection by sending a 10 commands and making sure the motor responds.
-    def check_can_connection(self):
-        """
-        Checks the motor's connection by attempting to send 10 startup messages.
-        If it gets 10 replies, then the connection is confirmed.
-
-        Returns:
-            True if a connection is established and False otherwise.
-        """
+    def check_can_connection(self, timeout: float = 1.0) -> bool:
+        """Robust connection check (gs_usb + socketcan)."""
         if not self._entered:
-            raise RuntimeError("Tried to check_can_connection before entering motor control! Enter control using the __enter__ method, or instantiating the TMotorManager in a with block.")
-        Listener = can.BufferedReader()
-        self._canman.notifier.add_listener(Listener)
-        for i in range(10):
+            raise RuntimeError(
+                "Tried to check_can_connection before entering manager context. "
+                "Call enable()/__enter__ first."
+            )
+
+        listener = can.BufferedReader()
+        self._canman.notifier.add_listener(listener)
+
+        try:
             self.power_on()
-            time.sleep(0.001)
-        success = True
-        time.sleep(0.1)
-        for i in range(10):
-            if Listener.get_message(timeout=0.1) is None:
-                success = False
-        self._canman.notifier.remove_listener(Listener)
-        return success
+            time.sleep(0.01)
+
+            tx_hz = 200.0
+            period = 1.0 / tx_hz
+            n = int(max(1, tx_hz * 0.2))  # ~0.2s burst
+            for _ in range(n):
+                # Kp=Kd=I=0 -> q_control=0 (should not move)
+                self._canman.MIT_controller(self.ID, self.type, 0.0, 0.0, 0.0, 0.0, 0.0)
+                time.sleep(period)
+
+            last_tx = self._canman.get_last_tx(self.ID)
+
+            end = time.time() + float(timeout)
+            while time.time() < end:
+                msg = listener.get_message(timeout=0.05)
+                if msg is None:
+                    continue
+                if getattr(msg, "dlc", 0) != 8:
+                    continue
+
+                data = bytes(msg.data)
+                if data in (ENTER_FRAME, EXIT_FRAME, ZERO_FRAME):
+                    continue
+                if last_tx is not None and data in last_tx:
+                    continue
+
+                # CubeMars reply: data[0] == motor_id
+                if data[0] == self.ID:
+                    return True
+
+            return False
+        finally:
+            try:
+                self._canman.notifier.remove_listener(listener)
+            except Exception:
+                pass
 
     # controller variables
     temperature = property(get_temperature_celsius, doc="temperature_degrees_C")
