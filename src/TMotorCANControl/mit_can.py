@@ -146,7 +146,22 @@ MIT_Params = {
             'Kt_actual': 0.153, # UNTESTED CONSTANT!
             'GEAR_RATIO': 10.0,
             'Use_derived_torque_constants': False, # true if you have a better model
-        }
+        },
+        'AK45-36': {
+            'P_min': -12.5,  
+            'P_max': 12.5,
+            'V_min': -6.0,   
+            'V_max': 6.0,
+            'T_min': -34.0,  
+            'T_max': 34.0,
+            'Kp_min': 0.0,   
+            'Kp_max': 500.0,
+            'Kd_min': 0.0,   
+            'Kd_max': 5.0, 
+            'Kt_TMotor': 0.11,  
+            'GEAR_RATIO': 36.0,   
+            'Use_derived_torque_constants': False,
+        },
 }
 """
 A Dictionary containing the parameters of each type of motor, as well as the error
