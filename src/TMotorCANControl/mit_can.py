@@ -159,6 +159,8 @@ MIT_Params = {
             'Kd_min': 0.0,   
             'Kd_max': 5.0, 
             'Kt_TMotor': 0.11,  
+            'Current_Factor': 0.59,  
+            'Kt_actual': 0.11,
             'GEAR_RATIO': 36.0,   
             'Use_derived_torque_constants': False,
         },
