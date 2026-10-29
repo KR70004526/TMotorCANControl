@@ -164,6 +164,29 @@ MIT_Params = {
             'GEAR_RATIO': 36.0,   
             'Use_derived_torque_constants': False,
         },
+        'AK45-10': {
+            # Source: CubeMars AK45-10 KV75 datasheet (24 V, single 14-bit encoder):
+            #   peak torque 7 Nm, no-load speed 180 rpm, KT 0.127 Nm/A, 10:1.
+            # V/T ranges follow the AK40-10 / AK45-36 convention used in this fork
+            # (V_max = no-load speed in rad/s, T_max = peak torque) because the
+            # CubeMars MIT parameter tables (V1.0.15 / V3.2.0) do not list AK45-10.
+            # Verify on hardware once: d(position)/dt vs reported velocity.
+            'P_min': -12.5,
+            'P_max': 12.5,
+            'V_min': -18.85,   # 180 rpm * 2*pi/60
+            'V_max': 18.85,
+            'T_min': -7.0,
+            'T_max': 7.0,
+            'Kp_min': 0.0,
+            'Kp_max': 500.0,
+            'Kd_min': 0.0,
+            'Kd_max': 5.0,
+            'Kt_TMotor': 0.127,  # KT from datasheet
+            'Current_Factor': 0.59,  # UNTESTED CONSTANT! (same as other models)
+            'Kt_actual': 0.163,  # UNTESTED CONSTANT! Kt_TMotor * 1.28 (same ratio as AK80-64 etc.)
+            'GEAR_RATIO': 10.0,
+            'Use_derived_torque_constants': False,
+        },
 }
 """
 A Dictionary containing the parameters of each type of motor, as well as the error
