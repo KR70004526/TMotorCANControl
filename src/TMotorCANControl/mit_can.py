@@ -165,18 +165,15 @@ MIT_Params = {
             'Use_derived_torque_constants': False,
         },
         'AK45-10': {
-            # Source: CubeMars AK45-10 KV75 datasheet (24 V, single 14-bit encoder):
-            #   peak torque 7 Nm, no-load speed 180 rpm, KT 0.127 Nm/A, 10:1.
-            # V/T ranges follow the AK40-10 / AK45-36 convention used in this fork
-            # (V_max = no-load speed in rad/s, T_max = peak torque) because the
-            # CubeMars MIT parameter tables (V1.0.15 / V3.2.0) do not list AK45-10.
-            # Verify on hardware once: d(position)/dt vs reported velocity.
+            # Source: CubeMars MIT-mode parameter table (AK45-10 column):
+            #   Position -12.5f..12.5f, Speed -20.0f..20.0f, Torque -8.0f..8.0f.
+            # KT / gear ratio from the AK45-10 KV75 datasheet (24 V, 10:1).
             'P_min': -12.5,
             'P_max': 12.5,
-            'V_min': -18.85,   # 180 rpm * 2*pi/60
-            'V_max': 18.85,
-            'T_min': -7.0,
-            'T_max': 7.0,
+            'V_min': -20.0,
+            'V_max': 20.0,
+            'T_min': -8.0,
+            'T_max': 8.0,
             'Kp_min': 0.0,
             'Kp_max': 500.0,
             'Kd_min': 0.0,
